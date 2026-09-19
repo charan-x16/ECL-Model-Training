@@ -1,0 +1,15 @@
+# Training configuration for YOLO11n on Jetson Nano
+model:
+  weights: yolo11n.pt   # pretrained checkpoint to start from
+  device: 0              # Jetson Nano GPU (CUDA device 0); use "cpu" as fallback
+
+train:
+  epochs: 100
+  imgsz: 640
+  batch: 8               # keep small — Jetson Nano has 4GB shared memory
+  workers: 2
+  patience: 50
+
+paths:
+  dataset_dir: data       # .tar is extracted here
+  output_dir: output      # all training artifacts are written here

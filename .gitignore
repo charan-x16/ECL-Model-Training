@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# YOLO training pipeline
+*.tar
+/data/
+/output/
+*.pt
+
