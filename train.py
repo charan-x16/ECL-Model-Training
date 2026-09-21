@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""YOLO11n training pipeline for Jetson Nano.
+"""YOLO11n training pipeline for NVIDIA CUDA GPUs.
 
 Steps:
   1. Locate and extract the .tar dataset file.
   2. Locate data.yaml inside the extracted dataset.
-  3. Train YOLO11n on the Jetson Nano GPU.
+  3. Train YOLO11n on the configured CUDA GPU.
   4. Write all training outputs (weights, metrics, logs, plots) to output/.
 """
 
 import argparse
 import logging
+import re
 import sys
 import tarfile
 from pathlib import Path
@@ -18,6 +19,25 @@ from typing import Optional
 import yaml
 
 ROOT = Path(__file__).resolve().parent
+
+
+def guard_jetson_allocator(device: str) -> None:
+    """Reject the L4T release with NVIDIA's known CUDA allocation bug."""
+    if device == "cpu":
+        return
+
+    release_file = Path("/etc/nv_tegra_release")
+    if not release_file.is_file():
+        return
+
+    release = release_file.read_text(errors="replace").splitlines()[0]
+    match = re.search(r"R(\d+).*REVISION:\s*(\d+)\.(\d+)", release)
+    if match and tuple(map(int, match.groups())) == (36, 4, 7):
+        raise RuntimeError(
+            "Jetson Linux 36.4.7 has a known NvMap/CUDA allocation bug that "
+            "prevents training even at batch=1. Upgrade to JetPack 6.2.2 "
+            "(L4T 36.5) or newer and reboot before using the GPU."
+        )
 
 
 def find_dataset_tar(explicit_path: Optional[str]) -> Path:
@@ -71,28 +91,63 @@ def find_data_yaml(search_dir: Path) -> Path:
 def resolve_device(requested: str) -> str:
     try:
         import torch
-    except ImportError:
-        logging.warning("PyTorch not importable; falling back to CPU.")
-        return "cpu"
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyTorch is not installed. Install the CUDA 12.8 PyTorch build "
+            "described in README.md before starting training."
+        ) from exc
 
     if requested != "cpu" and not torch.cuda.is_available():
-        logging.warning(
-            "CUDA device '%s' requested but not available; falling back to CPU. "
-            "Check JetPack/CUDA/PyTorch installation on the Jetson Nano.",
-            requested,
+        raise RuntimeError(
+            f"CUDA device '{requested}' was requested, but CUDA is unavailable. "
+            "Training was stopped to avoid an accidental multi-day CPU run. "
+            "Check the NVIDIA driver and CUDA-enabled PyTorch installation."
         )
-        return "cpu"
+
+    if requested.isdigit():
+        device_index = int(requested)
+        if device_index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device '{requested}' does not exist; PyTorch detected "
+                f"{torch.cuda.device_count()} CUDA device(s)."
+            )
+        properties = torch.cuda.get_device_properties(device_index)
+        logging.info(
+            "CUDA device %s: %s (%.1f GiB VRAM)",
+            requested,
+            properties.name,
+            properties.total_memory / (1024**3),
+        )
+
     return requested
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train YOLO11n on Jetson Nano.")
+    parser = argparse.ArgumentParser(description="Train YOLO11n on an NVIDIA CUDA GPU.")
     parser.add_argument("--tar", help="Path to the dataset .tar file (auto-detected if omitted).")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"), help="Path to config.yaml.")
     parser.add_argument("--epochs", type=int, help="Override epochs from config.")
     parser.add_argument("--batch", type=int, help="Override batch size from config.")
     parser.add_argument("--imgsz", type=int, help="Override image size from config.")
+    parser.add_argument("--workers", type=int, help="Override data-loader workers from config.")
     parser.add_argument("--device", help="Override device from config (e.g. 0 or cpu).")
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable automatic mixed precision (default: config value).",
+    )
+    parser.add_argument(
+        "--amp-check",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable Ultralytics' separate AMP self-test (default: config value).",
+    )
+    parser.add_argument(
+        "--force-extract",
+        action="store_true",
+        help="Re-extract the dataset even if an extracted data.yaml already exists.",
+    )
     parser.add_argument("--run-name", default="train", help="Name of this run's output subfolder.")
     args = parser.parse_args()
 
@@ -108,29 +163,53 @@ def main() -> None:
     output_dir = ROOT / cfg["paths"]["output_dir"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Locate + extract the .tar dataset.
-    tar_path = find_dataset_tar(args.tar)
-    logging.info("Extracting dataset: %s -> %s", tar_path, dataset_dir)
-    safe_extract(tar_path, dataset_dir)
+    # 1. Reuse an extracted dataset when possible; extraction can take several
+    # minutes and needlessly increases disk I/O on retries.
+    existing_yamls = list(dataset_dir.rglob("data.yaml")) if dataset_dir.is_dir() else []
+    if existing_yamls and not args.force_extract and args.tar is None:
+        data_yaml = find_data_yaml(dataset_dir)
+        logging.info("Reusing extracted dataset (use --force-extract to refresh it).")
+    else:
+        tar_path = find_dataset_tar(args.tar)
+        logging.info("Extracting dataset: %s -> %s", tar_path, dataset_dir)
+        safe_extract(tar_path, dataset_dir)
+        data_yaml = find_data_yaml(dataset_dir)
 
     # 2. Locate data.yaml inside the extracted dataset.
-    data_yaml = find_data_yaml(dataset_dir)
     logging.info("Using dataset config: %s", data_yaml)
 
-    # 3. Train YOLO11n using the Jetson Nano GPU.
+    # 3. Train YOLO11n using the configured GPU.
+    requested_device = str(args.device or cfg["model"]["device"])
+    guard_jetson_allocator(requested_device)
+    device = resolve_device(requested_device)
+
     from ultralytics import YOLO
 
-    device = resolve_device(str(args.device or cfg["model"]["device"]))
+    amp = args.amp if args.amp is not None else cfg["train"].get("amp", True)
+    amp_check = args.amp_check if args.amp_check is not None else cfg["train"].get("amp_check", True)
     logging.info("Training on device: %s", device)
+    logging.info("Automatic mixed precision: %s", "enabled" if amp else "disabled")
+
+    if amp and not amp_check and device != "cpu":
+        # Ultralytics 8.4.x checks AMP by loading a second YOLO model and
+        # running an eight-image FP32/FP16 comparison. That transient workload
+        # exhausts shared RAM on affected JetPack releases before training can
+        # begin. Orin supports FP16, so retain low-memory AMP training while
+        # skipping only that additional probe.
+        from ultralytics.engine import trainer as ultralytics_trainer
+
+        ultralytics_trainer.check_amp = lambda _model: True
+        logging.warning("Skipping the Ultralytics AMP self-test (amp_check=false).")
 
     model = YOLO(cfg["model"]["weights"])
     model.train(
         data=str(data_yaml),
-        epochs=args.epochs or cfg["train"]["epochs"],
-        imgsz=args.imgsz or cfg["train"]["imgsz"],
-        batch=args.batch or cfg["train"]["batch"],
-        workers=cfg["train"]["workers"],
+        epochs=args.epochs if args.epochs is not None else cfg["train"]["epochs"],
+        imgsz=args.imgsz if args.imgsz is not None else cfg["train"]["imgsz"],
+        batch=args.batch if args.batch is not None else cfg["train"]["batch"],
+        workers=args.workers if args.workers is not None else cfg["train"]["workers"],
         patience=cfg["train"]["patience"],
+        amp=amp,
         device=device,
         project=str(output_dir),
         name=args.run_name,

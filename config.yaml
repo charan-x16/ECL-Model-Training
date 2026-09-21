@@ -1,14 +1,16 @@
-# Training configuration for YOLO11n on Jetson Nano
+# Training configuration for YOLO11n on an NVIDIA RTX 5070 (12 GB)
 model:
-  weights: yolo11n.pt   # pretrained checkpoint to start from
-  device: 0              # Jetson Nano GPU (CUDA device 0); use "cpu" as fallback
+  weights: yolo11n.pt    # pretrained checkpoint to start from
+  device: 0              # first CUDA GPU; use "cpu" only for diagnostics
 
 train:
-  epochs: 100
+  epochs: 60
   imgsz: 640
-  batch: 8               # keep small — Jetson Nano has 4GB shared memory
-  workers: 2
+  batch: -1              # auto-size to approximately 60% GPU memory utilization
+  workers: 8             # reduce to 4 if the host has limited CPU/RAM
   patience: 50
+  amp: true               # FP16 improves throughput and reduces VRAM usage
+  amp_check: true         # run Ultralytics' normal mixed-precision safety check
 
 paths:
   dataset_dir: data       # .tar is extracted here
