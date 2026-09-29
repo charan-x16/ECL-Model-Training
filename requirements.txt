@@ -1,2 +1,8 @@
-ultralytics>=8.3.0
+# Keep the scientific stack compatible with both desktop CUDA systems and
+# Jetson's system-compiled extensions. OpenCV 4.12+ requires NumPy 2 on modern
+# Python, while the supported Jetson stack still requires the NumPy 1.x C API.
+numpy>=1.23,<2
+opencv-python>=4.6,<4.12
+sympy>=1.13.3
+ultralytics==8.4.36
 pyyaml>=6.0
