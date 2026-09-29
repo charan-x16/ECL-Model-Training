@@ -8,9 +8,16 @@ class the exported frames correspond to these cells of confusion_matrix.png:
   * wrong_class   - predicted <class>, true other class (row <class>, col other)
   * missed        - true <class>, predicted background  (row background, col <class>)
 
-Frames are saved under <class>/<category>/ with boxes drawn (green = ground
-truth, red = box at fault) and listed in report.csv, sorted by confidence so
-the most confident mistakes come first.
+Output under output/<run>/false_frames_<split>/:
+
+  reference/<class>/<category>/  annotated copies for review (green = ground
+                                 truth, red = box at fault), confidence-prefixed
+  training/images/, labels/      clean original frames and their YOLO label
+                                 files, ready to fix and add to a training set
+  report.csv                     one row per mistake, most confident first
+
+Frames scanned from the val split are validation data: if they move into
+training, replace them in val so validation scores stay honest.
 
 Usage:
   python find_false_frames.py                          # all classes, val split, run "train"
@@ -22,6 +29,7 @@ Usage:
 import argparse
 import csv
 import logging
+import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -118,6 +126,32 @@ def match_like_confusion_matrix(gt_boxes: np.ndarray, pred_boxes: np.ndarray, io
     return gt_to_pred, pred_to_gt, iou
 
 
+def export_original(image_path: Path, training_dir: Path, used_names: set[str]) -> Path:
+    """Copy an untouched frame and its label file into a YOLO images/labels layout.
+
+    Frames with no label file are background images and get an empty label.
+    """
+    from ultralytics.data.utils import img2label_paths
+
+    stem, n = image_path.stem, 1
+    while stem in used_names:  # same file name from different source folders
+        stem, n = f"{image_path.stem}_{n}", n + 1
+    used_names.add(stem)
+
+    image_dest = training_dir / "images" / f"{stem}{image_path.suffix}"
+    label_dest = training_dir / "labels" / f"{stem}.txt"
+    image_dest.parent.mkdir(parents=True, exist_ok=True)
+    label_dest.parent.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(image_path, image_dest)
+    label_path = Path(img2label_paths([str(image_path)])[0])
+    if label_path.is_file():
+        shutil.copy2(label_path, label_dest)
+    else:
+        label_dest.touch()
+    return image_dest
+
+
 def draw_frame(image, gt_classes, gt_boxes, names, fault_box, fault_label):
     import cv2
 
@@ -149,7 +183,9 @@ def main() -> None:
     parser.add_argument("--device", help="Override device from config (e.g. 0 or cpu).")
     parser.add_argument("--batch", type=int, default=16, help="Images per inference batch.")
     parser.add_argument("--no-missed", action="store_true", help="Skip exporting missed objects.")
-    parser.add_argument("--no-images", action="store_true", help="Only write report.csv.")
+    parser.add_argument("--no-images", action="store_true", help="Skip annotated reference images.")
+    parser.add_argument("--no-originals", action="store_true",
+                        help="Skip copying original frames and labels into training/.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -184,6 +220,8 @@ def main() -> None:
 
     report_dir = output_dir / args.run_name / f"false_frames_{args.split}"
     report_dir.mkdir(parents=True, exist_ok=True)
+    reference_dir, training_dir = report_dir / "reference", report_dir / "training"
+    used_names: set[str] = set()
     categories = ["fp_background", "wrong_class"] + ([] if args.no_missed else ["missed"])
 
     logging.info("Model: %s | data: %s | split: %s (%d images)", weights, data_yaml, args.split, len(images))
@@ -225,6 +263,7 @@ def main() -> None:
             if not faults:
                 continue
 
+            original = "" if args.no_originals else str(export_original(image_path, training_dir, used_names))
             image = None if args.no_images else cv2.imread(str(image_path))
             for n, (category, pred_cls, true_cls, box, conf, match_iou) in enumerate(faults):
                 pred_name = "background" if pred_cls is None else names.get(pred_cls, str(pred_cls))
@@ -239,7 +278,7 @@ def main() -> None:
                     else:
                         label = f"pred {pred_name} {conf:.2f} | true {true_name}"
                     suffix = f"_true-{true_name}" if category == "wrong_class" else ""
-                    folder = report_dir / owner / category
+                    folder = reference_dir / owner / category
                     folder.mkdir(parents=True, exist_ok=True)
                     saved_path = folder / f"{conf:.2f}_{image_path.stem}_{n}{suffix}.jpg"
                     cv2.imwrite(str(saved_path), draw_frame(image, gt_classes, gt_boxes, names, box, label))
@@ -255,6 +294,7 @@ def main() -> None:
                     "x1": round(float(box[0]), 1), "y1": round(float(box[1]), 1),
                     "x2": round(float(box[2]), 1), "y2": round(float(box[3]), 1),
                     "annotated_image": saved,
+                    "training_image": original,
                 })
 
         logging.info("Processed %d/%d images", min(start + args.batch, len(images)), len(images))
@@ -262,7 +302,7 @@ def main() -> None:
     rows.sort(key=lambda r: (r["category"], r["predicted_class"], r["true_class"], -r["confidence"]))
     report_path = report_dir / "report.csv"
     fieldnames = ["category", "predicted_class", "true_class", "image", "frame", "confidence",
-                  "iou_with_gt", "x1", "y1", "x2", "y2", "annotated_image"]
+                  "iou_with_gt", "x1", "y1", "x2", "y2", "annotated_image", "training_image"]
     with open(report_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -278,6 +318,8 @@ def main() -> None:
     for category in categories:
         for cell in sorted(c for c in boxes if c[0] == category):
             logging.info("%-14s %-12s %-12s %6d %6d", *cell, boxes[cell], len(frames[cell]))
+    if not args.no_originals:
+        logging.info("Copied %d original frames + labels to: %s", len(used_names), training_dir)
     logging.info("Report written to: %s", report_path)
 
 
